@@ -1,0 +1,239 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Simple Textract and Lambda demo. Incoming email messages are received by SES, persisted to S3 and any PDF, PNG or JPG
+  attachments have their text content extracted.
+
+Globals:
+  Function:
+    Timeout: 10
+
+Resources:
+  AttachmentsS3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-attachments"
+  TextractServiceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-textract-service"
+      ManagedPolicyArns:
+        # CloudWatch access
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        # VPC access
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaENIManagementAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "textract.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "sns:Publish"
+                Resource: !Ref TextractCallbackSNSTopic
+  TextractCallbackRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambda-textract-callback"
+      ManagedPolicyArns:
+        # CloudWatch access
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        # VPC access
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaENIManagementAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "TextractCallbackLambdaFunctionAccessGrants"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Allow writing entry to attachments Dynamo table
+              - Effect: "Allow"
+                Action: "dynamodb:PutItem"
+                Resource: !GetAtt AttachmentsDynamoTable.Arn
+              # Allow calling Textract's text detection API
+              - Effect: "Allow"
+                Action: "textract:GetDocumentTextDetection"
+                Resource: "*"
+  EmailParsingRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambda-email-parsing"
+      ManagedPolicyArns:
+        # CloudWatch access
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        # VPC access
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaENIManagementAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "EmailParsingLambdaFunctionAccessGrants"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Allow writing entry to emails Dynamo table
+              - Effect: "Allow"
+                Action: "dynamodb:PutItem"
+                Resource: !GetAtt EmailsDynamoTable.Arn
+              # Allow calling Textract's text detection API
+              - Effect: "Allow"
+                Action: "textract:StartDocumentTextDetection"
+                Resource: "*"
+              # Grant access to attachments bucket
+              - Effect: "Allow"
+                Action:
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                Resource: !Sub [ "${arn}/*", { arn: !GetAtt AttachmentsS3Bucket.Arn } ]
+              # Grant access to read raw emails
+              - Effect: "Allow"
+                Action: "s3:GetObject"
+                Resource:
+                  Fn::Sub:
+                    - "${arn}/*"
+                    - "arn":
+                        Fn::ImportValue:
+                          Fn::Sub:
+                            "${IncomingEmailStack}-RawEmailsS3BucketARN"
+  EmailParsing:
+    DependsOn:
+      - EmailsDynamoTable
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../functions/email_parsing/
+      Handler: app.lambda_handler
+      Runtime: python3.7
+      Role: !GetAtt EmailParsingRole.Arn
+      Layers:
+        - !Sub "arn:aws:lambda:${AWS::Region}:113088814899:layer:Klayers-python37-boto3:2"
+      Environment:
+        Variables:
+          EMAILS_DYNAMO_TABLE: !Ref EmailsDynamoTable
+          ATTACHMENTS_BUCKET: !Ref AttachmentsS3Bucket
+          TEXTRACT_NOTIFICATION_TOPIC_ARN: !Ref TextractCallbackSNSTopic
+          TEXTRACT_NOTIFICATION_ROLE_ARN: !GetAtt TextractServiceRole.Arn
+      Events:
+        IncomingEmail:
+          Type: SNS
+          Properties:
+            Topic:
+              Fn::ImportValue: !Sub "${IncomingEmailStack}-IncomingEmailSNSTopic"
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref EmailParsingSecurityGroup
+        SubnetIds:
+          - Fn::ImportValue: !Sub "${ComputeEnvStack}-LambdaSubnetA"
+          - Fn::ImportValue: !Sub "${ComputeEnvStack}-LambdaSubnetB"
+  EmailParsingSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${AWS::StackName}-email-parsing"
+      GroupDescription: Textract callback Lambda security group
+      VpcId:
+        Fn::ImportValue: !Sub "${ComputeEnvStack}-VPC"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-email-parsing"
+  TextractCallbackSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub "${AWS::StackName}-textract-callback"
+      TopicName: !Sub "${AWS::StackName}-textract-callback"
+  EmailsDynamoTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - { AttributeName: "email_id", AttributeType: "S" }
+      BillingMode: PROVISIONED
+      KeySchema:
+        - { AttributeName: "email_id", KeyType: "HASH" }
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      TableName: !Sub "${AWS::StackName}-emails"
+  AttachmentsDynamoTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - { AttributeName: "email_id", AttributeType: "S" }
+        - { AttributeName: "attachment_id", AttributeType: "S" }
+      BillingMode: PROVISIONED
+      KeySchema:
+        - { AttributeName: "email_id", KeyType: "HASH" }
+        - { AttributeName: "attachment_id", KeyType: "RANGE" }
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      TableName: !Sub "${AWS::StackName}-attachments"
+  TextractCallback:
+    DependsOn:
+      - AttachmentsDynamoTable
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../functions/textract_callback/
+      Handler: app.lambda_handler
+      Runtime: python3.7
+      Role: !GetAtt TextractCallbackRole.Arn
+      Layers:
+        - !Sub "arn:aws:lambda:${AWS::Region}:113088814899:layer:Klayers-python37-boto3:2"
+      Events:
+        TextractAnalysisComplete:
+          Type: SNS
+          Properties:
+            Topic: !Ref TextractCallbackSNSTopic
+      Environment:
+        Variables:
+          ATTACHMENTS_DYNAMO_TABLE: !Ref AttachmentsDynamoTable
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref TextractCallbackSecurityGroup
+        SubnetIds:
+          - Fn::ImportValue: !Sub "${ComputeEnvStack}-LambdaSubnetA"
+          - Fn::ImportValue: !Sub "${ComputeEnvStack}-LambdaSubnetB"
+  TextractCallbackSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${AWS::StackName}-textract-callback"
+      GroupDescription: Textract callback Lambda security group
+      VpcId:
+        Fn::ImportValue: !Sub "${ComputeEnvStack}-VPC"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-textract-callback"
+Parameters:
+  IncomingEmailStack:
+    Type: String
+    Description: Name of the parent stack for incoming emails
+  ComputeEnvStack:
+    Type: String
+    Description: Name of the parent stack for the compute environment
+Outputs:
+  EmailParsingFunction:
+    Value: !GetAtt EmailParsing.Arn
+  TextractCallbackFunction:
+    Value: !GetAtt TextractCallback.Arn

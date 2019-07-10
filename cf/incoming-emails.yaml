@@ -1,0 +1,67 @@
+AWSTemplateFormatVersion: 2010-09-09
+Resources:
+  DomainReceiptRule:
+    Type: 'AWS::SES::ReceiptRule'
+    Properties:
+      Rule:
+        Actions:
+          - S3Action:
+              BucketName: !Ref RawEmailMessagesS3Bucket
+              ObjectKeyPrefix: ""
+              TopicArn: !Ref IncomingEmailSNSTopic
+        Enabled: true
+        Name: !Sub "${AWS::StackName}-rule"
+        Recipients:
+          - !Ref DomainName
+        ScanEnabled: true
+      RuleSetName: !Ref DomainReceiptRuleSet
+    DependsOn:
+      - DomainReceiptRuleSet
+      - RawEmailMessagesSESPolicy
+      - IncomingEmailSNSTopic
+  RawEmailMessagesS3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-raw-emails"
+  DomainReceiptRuleSet:
+    Type: 'AWS::SES::ReceiptRuleSet'
+    Properties:
+      RuleSetName: !Sub "${AWS::StackName}-rule-set"
+  RawEmailMessagesSESPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref RawEmailMessagesS3Bucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - 's3:PutObject'
+            Effect: Allow
+            Resource: !Join [ '', [ 'arn:aws:s3:::', !Ref RawEmailMessagesS3Bucket, '/*' ] ]
+            Principal:
+              Service: ses.amazonaws.com
+            Condition:
+              StringEquals:
+                'aws:Referer': !Ref 'AWS::AccountId'
+    DependsOn:
+      - RawEmailMessagesS3Bucket
+  IncomingEmailSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub "${AWS::StackName}-email-received"
+      TopicName: !Sub "${AWS::StackName}-email-received"
+Parameters:
+  DomainName:
+    Type: String
+    Description: Domain name for incoming email receiving
+Outputs:
+  IncomingEmailSNSTopic:
+    Description: ARN of the incoming email notification topic
+    Value: !Ref IncomingEmailSNSTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-IncomingEmailSNSTopic"
+  RawEmailsS3BucketARN:
+    Description: ARN of the incoming email notification topic
+    Value: !GetAtt RawEmailMessagesS3Bucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RawEmailsS3BucketARN"
+
